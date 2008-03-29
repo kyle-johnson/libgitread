@@ -36,18 +36,22 @@ def sha1_to_hex(sha1):
 # !!! this function DOES handle short sha1's.
 def pack_idx_read(location, sha1=None):
     f = open(location)
-    
+        
     #test for version two
     if struct.unpack("!L", f.read(4))[0] == 4285812579:
         raise Exception, "Version 2 pack index files are not yet supported"
     
     f.seek(1020)
     count = struct.unpack("!L", f.read(4))[0]
-
+    print "total possibilities: %i" % count
+    
     if sha1:
         for i in range(count):
             offset = f.read(4)
             tempSha1 = sha1_to_hex(f.read(20))
+
+            if tempSha1[:6] == sha1[:6]:
+                print "%s vs \n%s" % (tempSha1, sha1)
             # did we find it?
             if tempSha1[:len(sha1)] == sha1:
                 f.close()
@@ -158,6 +162,73 @@ def loose_get_object(location, full=False):
         del dc
         return kind, size, tmpF
 
+# This class uses GitObject in a variety of methods
+# similar to those provided by git on the command line.
+#
+# Note that these print nothing out, but mostly return
+# objects of various sorts which are easily printed
+# via a main() function if desired.
+#
+# Current emphasis is on read-only operations.
+class Git(object):
+    repo = None # path to .git dir
+    head = None # name (ie. master)
+    headSha1 = None
+    
+    def __init__(self, repo=None):
+        # make sure we have the repo dir right
+        if not repo:
+            if os.getcwd().split('/')[-1:] == '.git':
+                self.repo = os.getcwd()
+            elif os.path.exists(os.path.join(os.getcwd(), '.git')):
+                self.repo = os.path.join(os.getcwd(), '.git')
+            else:
+                raise Exception, "Could not location .git directory"
+        else:
+            if repo.split('/')[-1:] == '.git':
+                self.repo = repo
+            elif os.path.exists(os.path.join(repo, '.git')):
+                self.repo = os.path.join(repo, '.git')
+            else:
+                raise Exception, "Could not location .git directory"
+        
+        # find current head
+        f = open(os.path.join(self.repo, 'HEAD'))
+        f.seek(5) # "ref: "
+        headPath = os.path.join(self.repo, f.read()[:-1]) # ignore trailing \n
+        f.close()
+        
+        f = open(headPath)
+        self.head = headPath.split('/').pop()
+        self.headSha1 = f.read()[:-1] # ignore trailing \n
+        f.close()
+        self.headObj = GitObject(self.headSha1, self.repo)
+    
+    # git branch
+    #
+    # Returns: list of (branch name, current)
+    def list_branches(self):
+        branches = []
+        for branch in os.listdir("self.repo.refs.heads"):
+            if branch is self.head:
+                branches.append( (branch, True) )
+            else:
+                branches.append( (branch, False) )
+        return branches
+
+    # git rev-list --maxcount=1 <commit> <path>
+    #
+    # If commit is left as None, then the current head is used.
+    #
+    # Returns: commit where <path>'s contents last changed.
+    def rev_list(self, path, commit=None):
+        # prep path if needed
+        if self.repo[:-4] == path[:len(self.repo)-4]:
+            path = 1
+        initialTree = GitObject(self.headObj.tree, self.repo)
+        for filename, sha1 in initialTree.entries:
+            pass
+
 class GitObject(object):
     location = None # LOOSE or PACKED
     kind = None # aka: type
@@ -176,21 +247,9 @@ class GitObject(object):
     author = None
     commitTime = None
     
-    def __init__(self, sha1, gitDir=None, lazy=True):
-        t1 = time.time()
-        if not gitDir:
-            raise Exception, "you must supply the base project directory"
-            return
-        
-        if gitDir.split('/')[-1:] == '.git':
-            self.dir = gitDir
-        else:
-            self.dir = os.path.join(gitDir, '.git')
-        if not os.path.exists(self.dir):
-            raise Exception, "%s is not the base project directory" % gitDir
-            return
-        
-        self.sha1 = sha1 #sha1_to_hex(sha1)
+    def __init__(self, sha1, gitDir, lazy=True):        
+        self.dir = gitDir
+        self.sha1 = sha1
         
         # now try and find out where the object is; loose first, then pack
         foundLoose = False
@@ -248,9 +307,6 @@ class GitObject(object):
         if not self.location:
             raise Exception, "object %s does not exist" % self.sha1
             return
-        
-        t2 = time.time()
-        print "Total __init__ time: %f" % (t2-t1)
     
     def loadTree(self):
         closeRaw = False # if __init__ called, then it will close self.raw
@@ -296,17 +352,17 @@ class GitObject(object):
             self.raw.seek(self.raw.tell() + 8) # "\nparent "
             self.parent = self.raw.read(40)
             
-            self.raw.seek(self.raw.tell() + 8) # "\nauthor "
-            line = self.raw.readline()
-            self.author = line[:line.index('>')+1] # include the email address
+            #self.raw.seek(self.raw.tell() + 8) # "\nauthor "
+            #line = self.raw.readline()
+            #self.author = line[:line.index('>')+1] # include the email address
             
-            self.raw.seek(self.raw.tell() + 10) # "comitter "
-            line = self.raw.readline()
-            self.comitter = line[:line.index('>')+1]
-            self.commitTime = line[line.index('>')+2:len(line)-1]
+            #self.raw.seek(self.raw.tell() + 10) # "comitter "
+            #line = self.raw.readline()
+            #self.comitter = line[:line.index('>')+1]
+            #self.commitTime = line[line.index('>')+2:len(line)-1]
             
-            self.raw.seek(self.raw.tell() + 1) # "\n"
-            self.message = self.raw.read() # get the rest
+            #self.raw.seek(self.raw.tell() + 1) # "\n"
+            #self.message = self.raw.read() # get the rest
         
     def loadTag(self):
         pass
