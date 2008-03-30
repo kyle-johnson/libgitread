@@ -1,46 +1,16 @@
-#include <stdlib.h>
-#include <stdio.h>
+#include "libgitread.h"
 #include <assert.h>
-#include <string.h>
 
 #include <zlib.h>
 
-// defined in git's cache.h
-#define UKNOWNTYPE -1 // aka: OBJ_BAD
-#define COMMIT  1
-#define TREE    2
-#define BLOB    3
-#define TAG     4
 
-#define OFS_DELTA 6
-#define REF_DELTA 7
-
-
-#define CHUNKSIZE (128*4)
-
-#define IDX_VERSION_TWO_SIG 0xff744f63 // '\377tOc'
-
-struct idx_v1_entry { // file format
-    unsigned char offset[4];
-    unsigned char sha1[20];
-};
-
-struct idx_entry { // nice format
-    unsigned int offset;
-    unsigned char sha1[40];
-};
-
-struct git_object {
-    unsigned int type;
-    unsigned int size;
-    FILE *data;
-};
+#define CHUNKSIZE (1024*4)
 
 // Taken directly from sha1_file.c from git v 1.5.5
 //
-// This uses a funky buffer/cache thing which can be removed,
+// This uses a funky buffer/cache thing which could be removed,
 // but why bother?
-static char * sha1_to_hex(const unsigned char * sha1)
+char * sha1_to_hex(const unsigned char * sha1)
 {
 	static int bufno;
 	static char hexbuffer[4][50];
@@ -58,21 +28,129 @@ static char * sha1_to_hex(const unsigned char * sha1)
 	return buffer;
 }
 
-// Currently, deltafied data is NOT supported.
-//
-// There's a LOT of common code between this and loose_get_object; probably should
-// do some refactoring to combine common parts later.
-static int pack_get_object(char * location, unsigned int offset, struct git_object * g_obj, int full)
+// Taken from patch-delta.c from git v 1.5.5 with some small changes.
+void *patch_delta(const void *src_buf, unsigned long src_size,
+		  const void *delta_buf, unsigned long delta_size,
+		  unsigned long dst_size)
 {
-    FILE *pack_fp = NULL, *tmp = NULL;
+	const unsigned char *data, *top;
+	unsigned char *dst_buf, *out, cmd;
+	unsigned long size;
+
+	if (delta_size < DELTA_SIZE_MIN)
+		return NULL;
+
+	data = delta_buf;
+	top = (const unsigned char *) delta_buf + delta_size;
+
+    size = dst_size;
+
+	dst_buf = malloc(size + 1);
+	dst_buf[size] = 0; // what is with this??
+
+	out = dst_buf;
+	while (data < top) {
+		cmd = *data++;
+		if (cmd & 0x80) {
+			unsigned long cp_off = 0, cp_size = 0;
+			if (cmd & 0x01) cp_off = *data++;
+			if (cmd & 0x02) cp_off |= (*data++ << 8);
+			if (cmd & 0x04) cp_off |= (*data++ << 16);
+			if (cmd & 0x08) cp_off |= (*data++ << 24);
+			if (cmd & 0x10) cp_size = *data++;
+			if (cmd & 0x20) cp_size |= (*data++ << 8);
+			if (cmd & 0x40) cp_size |= (*data++ << 16);
+			if (cp_size == 0) cp_size = 0x10000;
+			if (cp_off + cp_size < cp_size ||
+			    cp_off + cp_size > src_size ||
+			    cp_size > size)
+				break;
+			memcpy(out, (char *) src_buf + cp_off, cp_size);
+			out += cp_size;
+			size -= cp_size;
+		} else if (cmd) {
+			if (cmd > size)
+				break;
+			memcpy(out, data, cmd);
+			out += cmd;
+			data += cmd;
+			size -= cmd;
+		} else {
+			// cmd == 0 is reserved for future encoding
+			// extensions. In the mean time we must fail when
+			// encountering them (might be data corruption).
+            free(dst_buf);
+            return NULL;
+		}
+	}
+
+	// sanity check
+	if (data != top || size != 0) {
+		free(dst_buf);
+		return NULL;
+	}
+
+	//*dst_size = out - dst_buf;
+	return dst_buf;
+}
+
+
+// Taken from delta.h  from git v 1.5.5 with some small changes to work
+// with file pointers instead of data buffers.
+//
+// This must be called twice on the delta pack entry: first to get the
+// expected source size, and again to get the target size.
+static inline unsigned int get_delta_hdr_size(FILE *pack_fp)
+{
+	unsigned char cmd;
+	unsigned int size = 0;
+	int i = 0;
+	do {
+        fread(&cmd, 1, 1, pack_fp);
+		size |= (cmd & ~0x80) << i;
+		i += 7;
+    } while (cmd & 0x80); // && data < top);
+    
+	return size;
+}
+
+
+// Some notes on deltafied data:
+//  - Base objects will _always_ be located in the same pack file.
+//  - Base objects may be delta objects as well (up to 50 by git's defaults); yes, this
+//    can led to many recursive function calls to finally get a "complete" base object.
+//  - The base object's type is the result ("un-deltafied") object's type.
+//  - REF_DELTA consists of a 20 byte binary SHA1 which is the address of the base object,
+//    followed by the delta data.
+//  - OFS_DELTA is newer. It consists of a sequence of bytes (similar to those at the
+//    start of a pack entry) which provides the offset _before_ the current pack object
+//    at which the base object can be found. The delta data follows.
+//  - The first entry in the delta data is the length of the base object; this length is
+//    encoded similarly to the pack entry's length.
+//  - The second entry in the delta data is the length of the result object; encoding is
+//    identical to the previous entry.
+//  - The rest of the delta data is made up of one or more delta hunks: data and
+//    instructions for how to create the result object.
+//
+//  More info: http://git.rsbx.net/Documents/Git_Data_Formats.txt
+//
+// ! There's a LOT of common code between this and loose_get_object; probably should
+// do some refactoring to combine common parts later.
+int pack_get_object(char * location, unsigned int offset, struct git_object * g_obj, int full)
+{
+    FILE *pack_fp = NULL, *delta_fp = NULL;
     z_stream zst;
-    unsigned char real_read_buffer[CHUNKSIZE], real_write_buffer[CHUNKSIZE];
+    struct git_object base_object; // used for deltas
+    unsigned char real_read_buffer[CHUNKSIZE], real_write_buffer[CHUNKSIZE]; // global to prevent stack overflow?
     unsigned char *read_buffer = real_read_buffer, *write_buffer = real_write_buffer;
 
     int status;
     int amount_read = 0;
     unsigned int size = 0, type = 0, shift;
+    unsigned int base_size = 0, result_size = 0; // used for deltas
     unsigned char byte;
+
+    int i;
     
     // initialize
     g_obj->size = 0;
@@ -89,13 +167,12 @@ static int pack_get_object(char * location, unsigned int offset, struct git_obje
     // check the docs for details:
     //  http://www.kernel.org/pub/software/scm/git/docs/technical/pack-format.txt
     fread(&byte, 1, 1, pack_fp);
-    type = (byte >> 4) & 7;             // bits 5 - 7
-    size = byte & 0xf;                  // start with bits 0 - 4
-    // get the rest of the size if needed
+    type = (byte >> 4) & 7;
+    size = byte & 0xf;
     shift = 4;
-    while((byte & 128) != 0) {
+    while(byte & 128) {
         fread(&byte, 1, 1, pack_fp);
-        size |= (byte & 0x7f) << shift; // need only bits 0 - 7
+        size += (byte & 0x7f) << shift;
         shift += 7;
     }
     
@@ -103,16 +180,66 @@ static int pack_get_object(char * location, unsigned int offset, struct git_obje
     g_obj->type = type;
     
     // they just need the type/size
-    if(!full && (type == BLOB || type == OFS_DELTA || type == REF_DELTA) ) {
+    if(!full && type == BLOB) {
         fclose(pack_fp);
         return 0;
     }
     
     if(!(g_obj->data = tmpfile())) {
-        // can't make a temporary file for the data
         fclose(pack_fp);
         return -1;
     }
+    
+    if(type == REF_DELTA) {
+        printf("==== REF_DELTA\n\n");
+        struct idx_entry *base_idx;
+        
+        char * sha1;
+        char * idx_location;
+        
+        // get the sha1        
+        fread(read_buffer, 1, 20, pack_fp);
+        sha1 = sha1_to_hex(read_buffer);
+        
+        // find the offset from the index file
+        if(!(idx_location = (char *) malloc(sizeof(char)*strlen(location)))) {
+            fclose(pack_fp);
+            return -1;
+        }
+        memcpy(idx_location, location, strlen(location) - 4);  // remove "pack" extension
+        memcpy((char *) (&idx_location + strlen(location) - 4), "idx", 4); // add "idx" plus \0
+        base_idx = pack_idx_read(idx_location, sha1);
+        free(idx_location);
+        if(base_idx == NULL) {
+            fclose(pack_fp);
+            return -1;
+        }
+        
+        // get the base object
+        if(pack_get_object(location, base_idx->offset, &base_object, 1) != 0) {
+            free(base_idx);
+            fclose(pack_fp);
+            return -1;
+        }
+    } else if(type == OFS_DELTA) {
+        printf("==== OFS_DELTA\n\n");
+        
+        unsigned int pack_offset;
+        fread(&byte, 1, 1, pack_fp);
+        pack_offset = byte & 0x7f;
+        while(byte & 0x80) {
+            fread(&byte, 1, 1, pack_fp);
+            pack_offset += 1;
+            pack_offset = (pack_offset << 7) + (byte & 0x7f);
+        }
+        pack_offset = offset - pack_offset;
+
+        // get the base object
+        if(pack_get_object(location, pack_offset, &base_object, 1) != 0) {
+            fclose(pack_fp);
+            return -1;
+        }
+    }    
     
     zst.zalloc = Z_NULL; // use defaults
     zst.zfree = Z_NULL; // ''
@@ -152,6 +279,7 @@ static int pack_get_object(char * location, unsigned int offset, struct git_obje
                 case Z_MEM_ERROR:
                     inflateEnd(&zst);
                     fclose(pack_fp);
+                    printf("=== zlib says: %i\n", status);
                     return status;
             }
      
@@ -164,9 +292,68 @@ static int pack_get_object(char * location, unsigned int offset, struct git_obje
             }
         } while(zst.avail_out == 0);
     } while (status != Z_STREAM_END);
-    
-    fclose(pack_fp);
     inflateEnd(&zst);
+    fclose(pack_fp);
+
+    if(type == REF_DELTA || type == OFS_DELTA) {
+        fseek(g_obj->data, 0, SEEK_SET);
+        
+        // have to get these two sizes before decompression
+        base_size = get_delta_hdr_size(g_obj->data);
+        result_size = get_delta_hdr_size(g_obj->data);
+        
+        // needed 'since those two hdr_sizes are included in the delta size
+        size -= ftell(g_obj->data);
+        
+        g_obj->type = base_object.type;
+        g_obj->size = result_size;
+
+        if(!(delta_fp = tmpfile())) {
+            fclose(g_obj->data);
+            fclose(base_object.data);
+            return -1;
+        }
+                
+        // at this point, we have the two pieces of data to make the result:
+        // 1) g_obj->data is the delta data
+        // 2) base_object.data is the base data
+        //
+        // size = delta size
+        // base_size = base size
+        // result_size = result size
+        {
+            unsigned char *delta_buffer, *base_buffer, *result_buffer;
+            delta_buffer = (unsigned char *) malloc(size);
+            base_buffer = (unsigned char *) malloc(base_size);
+            
+            // fseek(g_obj->data, 0, SEEK_SET);
+            fseek(base_object.data, 0, SEEK_SET);
+            
+            fread(delta_buffer, 1, size, g_obj->data);
+            fread(base_buffer, 1, base_size, base_object.data);
+
+            fclose(g_obj->data);
+            fclose(base_object.data);
+            
+            result_buffer = (unsigned char *) patch_delta(base_buffer, base_size, delta_buffer, size, result_size);
+            free(delta_buffer);
+            free(base_buffer);
+            if(result_buffer == NULL) {
+                return -1;
+            }
+            
+            // copy result buffer to a file
+            if(!(g_obj->data = tmpfile())) {
+                free(result_buffer);
+                return -1;
+            }
+            fwrite(result_buffer, 1, result_size, g_obj->data);
+            free(result_buffer);
+            
+            return 0;
+        }
+    }
+
     return 0;
 }
 
@@ -174,7 +361,7 @@ static int pack_get_object(char * location, unsigned int offset, struct git_obje
 //       match. This could result in false positives with extremely shortened sha1s.
 //
 // Version 2 idx files are currently not supported.
-static struct idx_entry * pack_idx_read(char * location, char * sha1)
+struct idx_entry * pack_idx_read(char * location, char * sha1)
 {
     FILE *idx_fp = NULL;
     struct idx_v1_entry entry;
@@ -228,7 +415,7 @@ static struct idx_entry * pack_idx_read(char * location, char * sha1)
 }
 
 // much of this function is from the zlib zpipe.c example
-static int loose_get_object(char * location, struct git_object * g_obj, int full)
+int loose_get_object(char * location, struct git_object * g_obj, int full)
 {
     FILE *loose_fp = NULL;
     FILE *tmp = NULL;
@@ -356,22 +543,22 @@ static int loose_get_object(char * location, struct git_object * g_obj, int full
     return 0;
 }
 
-int main(void)
+/*static int main(int argc, char *argv[])
 {
-    /*
-    struct idx_entry * entry = NULL;
     
-    entry = pack_idx_read("/Users/kylejohnson/vector/cairo/.git/objects/pack/pack-4a32c03738a275d48dfb8927d44ccf3bbe1c1713.idx",
-                          "1ab804891bb71fd742");
-    if(entry != NULL) {
-        printf("sha1: %s\n", entry->sha1);
-        printf("offset: %i\n", entry->offset);
-    }/**/
+    //struct idx_entry * entry = NULL;
     
-    ///*
+    //entry = pack_idx_read("/Users/kylejohnson/vector/cairo/.git/objects/pack/pack-4a32c03738a275d48dfb8927d44ccf3bbe1c1713.idx",
+    //                      "1ab804891bb71fd742");
+    //if(entry != NULL) {
+    //    printf("sha1: %s\n", entry->sha1);
+    //    printf("offset: %i\n", entry->offset);
+    //}
+    
+    
     struct git_object g_obj;
     
-    printf("exit: %i\n\n", pack_get_object("/Users/kylejohnson/vector/cairo/.git/objects/pack/pack-4a32c03738a275d48dfb8927d44ccf3bbe1c1713.pack", 12, &g_obj, 0) );
+    printf("exit: %i\n\n", pack_get_object("/Users/kylejohnson/vector/cairo/.git/objects/pack/pack-4a32c03738a275d48dfb8927d44ccf3bbe1c1713.pack", (argc > 1)? atoi(argv[1]): 1207716, &g_obj, (argc > 2)? 1:0) );
     switch(g_obj.type) {
         case COMMIT:
             printf("type is commit\n");
@@ -390,7 +577,7 @@ int main(void)
     }
     printf("size is: %i\n", g_obj.size);
     if(g_obj.data != NULL)
-        printf("data object exists!\n\n"); /**/
-    
+        printf("data object exists!\n\n");
+
     return 0;
-}
+}*/
