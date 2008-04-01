@@ -81,6 +81,24 @@ class Git(object):
         initialTree = GitObject(self.headObj.tree, self.repo)
         for filename, sha1 in initialTree.entries:
             pass
+    
+    # git ls-tree <tree|commit>
+    # Returns: a list of tree entries where each entry is a tuple: (mode, filename, sha1)
+    #          or None on error.
+    def ls_tree(self, tree):
+        tree = GitObject(tree, self.repo)
+        
+        if tree.kind is TREE:
+            entries = tree.entries
+        elif tree.kind is COMMIT:
+            realtree = GitObject(tree.tree, self.repo)
+            entries = realtree.entries
+            del realtree
+        else:
+            entries = None
+            
+        del tree
+        return entries
 
 class GitObject(object):
     location = None # LOOSE or PACKED
@@ -145,7 +163,7 @@ class GitObject(object):
         if raw:
             self.raw = raw
             if self.kind == TREE:
-                self.tree = self.raw
+                self.entries = self.raw
                 #self.loadTree()
             elif self.kind == COMMIT:
                 self.loadCommit()
