@@ -155,7 +155,7 @@ class GitObject(object):
                 # might as well load into ram.... delete GitObjects you don't use, k?
                 self.data = self.raw.read()
             
-            if self.kind in (COMMIT, TAG, BLOB):
+            if self.kind in (COMMIT, TAG, BLOB): # tree types don't return file objects!
                 self.raw.close()
             self.raw = None
             
@@ -163,36 +163,6 @@ class GitObject(object):
         if not self.location:
             raise Exception, "object %s does not exist" % self.sha1
             return
-    
-    def loadTree(self):
-        closeRaw = False # if __init__ called, then it will close self.raw
-        # quick error check
-        if not self.location:
-            raise Exception, "This is an involid object"
-            return
-        
-        # begin loading
-        if not self.entries and self.kind == TREE:
-            self.entries = []
-            
-            #if not self.raw:
-            #    closeRaw = True
-            #    if self.location == LOOSE:
-            #        _, _, self.raw = loose_get_object(self.path, full=True)
-            #    else: # PACKED
-            #        _, _, self.raw = pack_get_object(self.path, self.offset, full=True)
-            
-            #while self.raw.tell() < self.size:
-            #    fileName = []
-            #    c = self.raw.read(1)
-            #    fileName.append(c)
-            #    while c != '\x00':
-            #        c = self.raw.read(1)
-            #        fileName.append(c)
-                    
-                # remove the \0 from the list
-            #    del fileName[len(fileName)-1]
-            #    self.entries.append( (''.join(fileName[fileName.index(' ')+1:]), sha1_to_hex(self.raw.read(20))) )
     
     def loadCommit(self):
         closeRaw = False # if __init__ called, then it will close self.raw
@@ -218,7 +188,7 @@ class GitObject(object):
             #self.commitTime = line[line.index('>')+2:len(line)-1]
             
             #self.raw.seek(self.raw.tell() + 1) # "\n"
-            #self.message = self.raw.read() # get the rest
+            self.message = self.raw.read() # get the rest
         
     def loadTag(self):
         pass
