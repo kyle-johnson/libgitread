@@ -35,6 +35,7 @@ struct git_object {
     FILE *data;
 };
 
+int bin_tree_to_ascii_tree(struct git_object *g_obj);
 char * sha1_to_hex(const unsigned char * sha1);
 int pack_get_object(char * location,
                     unsigned int offset,

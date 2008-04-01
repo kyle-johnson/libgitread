@@ -3,8 +3,50 @@
 
 #include <zlib.h>
 
-
 #define CHUNKSIZE (1024*4)
+
+// Since some scripting languages have issues with binary sha1 digests
+// and strings with null charactres, this function is provided to turn
+// a git_objec.data file for a tree into a pure-ascii representation.
+// One tree entry per line:
+//      mode name sha1
+int bin_tree_to_ascii_tree(struct git_object *g_obj)
+{
+    unsigned char *source_internal_buffer, *src_buff,
+                  *end, *pos;
+    char *sha1;
+    
+    if(!(source_internal_buffer = (unsigned char *) malloc(g_obj->size)))
+        return -1;
+    
+    fseek(g_obj->data, 0, SEEK_SET);
+    fread(source_internal_buffer, 1, g_obj->size, g_obj->data);
+    src_buff = source_internal_buffer;
+    fclose(g_obj->data);
+    
+    if(!(g_obj->data = tmpfile())) {
+        free(source_internal_buffer);
+        return -2;
+    }
+    
+    end = (unsigned char *) src_buff + g_obj->size;
+    
+    while(src_buff < end) {
+        pos = memchr(src_buff, '\0', 1024); // get the mode and filename
+        fwrite(src_buff, 1, pos - src_buff, g_obj->data);
+        fwrite(" ", 1, 1, g_obj->data);
+        src_buff = (unsigned char *) pos + 1;
+        
+        sha1 = sha1_to_hex(src_buff);
+        fwrite(sha1, 1, 40, g_obj->data);
+        fwrite("\n", 1, 1, g_obj->data);
+        src_buff += 20;
+    }
+    fseek(g_obj->data, 0, SEEK_SET);
+    free(source_internal_buffer);
+    
+    return 0;
+}
 
 // Taken directly from sha1_file.c from git v 1.5.5
 //
@@ -349,11 +391,10 @@ int pack_get_object(char * location, unsigned int offset, struct git_object * g_
             }
             fwrite(result_buffer, 1, result_size, g_obj->data);
             free(result_buffer);
-            
-            return 0;
         }
     }
 
+    fseek(g_obj->data, 0, SEEK_SET);
     return 0;
 }
 
@@ -524,7 +565,15 @@ int loose_get_object(char * location, struct git_object * g_obj, int full)
             //
             // If this doesn't work, a larger CHUNKSIZE should fix the problem.
             if(full) {
-                if(fwrite(write_buffer, 1, amount_read, g_obj->data) != amount_read || ferror(g_obj->data)) {
+                if(ftell(g_obj->data) == 0) {
+                    c_ptr = (unsigned char*) memchr(write_buffer, '\0', amount_read) + 1;
+                    fwrite(c_ptr, 1, amount_read - (c_ptr - write_buffer), g_obj->data);
+                } else {
+                    fwrite(write_buffer, 1, amount_read, g_obj->data);
+                }
+                
+                if(ferror(g_obj->data)) {
+                //if(fwrite(write_buffer, 1, amount_read, g_obj->data) != amount_read || ferror(g_obj->data)) {
                     fclose(loose_fp);
                     inflateEnd(&zst);
                     return -1;
@@ -537,9 +586,10 @@ int loose_get_object(char * location, struct git_object * g_obj, int full)
             }
         } while(zst.avail_out == 0);
     } while (status != Z_STREAM_END);
-    
-    fclose(loose_fp);
     inflateEnd(&zst);
+    fclose(loose_fp);
+    
+    fseek(g_obj->data, 0, SEEK_SET);
     return 0;
 }
 
