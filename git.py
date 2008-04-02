@@ -27,6 +27,7 @@ class Git(object):
     repo = None # path to .git dir
     head = None # name (ie. master)
     headSha1 = None
+    headObj = None # GitObject for the head commit
     
     def __init__(self, repo=None):
         # make sure we have the repo dir right
@@ -69,18 +70,90 @@ class Git(object):
                 branches.append( (branch, False) )
         return branches
 
-    # git rev-list --maxcount=1 <commit> <path>
+    # git rev-list [--maxcount=x] <commit> [<path>]
     #
     # If commit is left as None, then the current head is used.
+    # If path is provided, maxcount will be considered as 1.
     #
-    # Returns: commit where <path>'s contents last changed.
-    def rev_list(self, path, commit=None):
-        # prep path if needed
-        if self.repo[:-4] == path[:len(self.repo)-4]:
-            path = 1
-        initialTree = GitObject(self.headObj.tree, self.repo)
-        for filename, sha1 in initialTree.entries:
-            pass
+    # Returns: list of commit objects
+    def rev_list(self, commit=None, maxcount=None, path=None):
+        commits = []
+        i = 1
+        
+        if maxcount == 0:
+            raise Exception, "maxcount must be greater than zero"
+            return None
+        
+        if commit is None:
+            workingCommit = self.headObj # no reason to query it again
+        else:
+            workingCommit = GitObject(commit, self.repo)
+        
+        if path is None:
+            commits.append(workingCommit)
+            
+            while workingCommit.parent != None and i != maxcount:
+                i = i + 1
+                workingCommit = GitObject(workingCommit.parent, self.repo)
+                commits.append(workingCommit)
+            
+            return commits
+        else:
+            # The idea here is find the last time the path was changed.
+            #
+            # 1) Start by finding its (and any parent trees it's in) sha1 for the
+            #    given commit.
+            # 2) Compare those sha1's--starting with the top-most level--with the parent commit.
+            # 3) Update upper-level sha1's as needed until the bottom-most sha1 (the actual blob)
+            #    changes.
+            # 4) Go forward one commit and return it.
+            
+            def build_tree(path, tree):
+                pathSha1s = []
+                for i in range(len(path)):
+                    for mode, sha1, name in tree:
+                        if i != len(path) - 1:
+                            # then we are looking for directories
+                            if mode == 40000 and name == path[i]:
+                                pathSha1s.append(sha1)
+                                break
+                        else:
+                            # then we are looking for a file
+                            if mode != 40000 and name == path[i]:
+                                pathSha1s.append(sha1)
+                                break
+                    if i + 1 == len(pathSha1s) and i + 1 < len(path):
+                        # we need another tree to dig down
+                        tree = GitObject(sha1, self.repo).entries
+                    else:
+                        break
+                return pathSha1s
+            
+            # prep path if needed (we just want the path within the rep, not a full path)
+            if self.repo[:-4] == path[:len(self.repo)-4]: # compare without "/.git"
+                path = path[len(self.repo[:-4]):]
+            path = path.split('/')
+                        
+            initialSha1Tree = build_tree(path, GitObject(workingCommit.tree, self.repo).entries)
+            if len(path) != len(initialSha1Tree):
+                raise Exception, "That path does not exist within the provided commit"
+                return None
+            if workingCommit.parent == None:
+                # initial commit
+                return workingCommit
+            
+            previousCommit = workingCommit
+            workingCommit = GitObject(workingCommit.parent, self.repo)
+            sha1Tree = build_tree(path, GitObject(workingCommit.tree, self.repo).entries)
+            while len(sha1Tree) == len(initialSha1Tree) and sha1Tree[-1:] == initialSha1Tree[-1:] and workingCommit.parent != None:
+                previousCommit = workingCommit
+                workingCommit = GitObject(workingCommit.parent, self.repo)
+                if workingCommit.tree == None:
+                    raise Exception, "there is a problem in the function!!!"
+                    return None
+                sha1Tree = build_tree(path, GitObject(workingCommit.tree, self.repo).entries)
+            
+            return previousCommit
     
     # git ls-tree <tree|commit>
     # Returns: a list of tree entries where each entry is a tuple: (mode, filename, sha1)
@@ -93,11 +166,11 @@ class Git(object):
         elif tree.kind is COMMIT:
             realtree = GitObject(tree.tree, self.repo)
             entries = realtree.entries
-            del realtree
+            #del realtree # doesn't this happen automatically? :P
         else:
             entries = None
             
-        del tree
+        #del tree # doesn't this also happen automatically? :P
         return entries
 
 class GitObject(object):
@@ -118,7 +191,8 @@ class GitObject(object):
     author = None
     commitTime = None
     
-    def __init__(self, sha1, gitDir, lazy=True):        
+    def __init__(self, sha1, gitDir, lazy=True):
+        print "######## " + sha1
         self.dir = gitDir
         self.sha1 = sha1
         
@@ -162,14 +236,14 @@ class GitObject(object):
         
         if raw:
             self.raw = raw
-            if self.kind == TREE:
+            if self.kind is TREE:
                 self.entries = self.raw
                 #self.loadTree()
-            elif self.kind == COMMIT:
+            elif self.kind is COMMIT:
                 self.loadCommit()
-            elif self.kind == TAG:
+            elif self.kind is TAG:
                 self.loadTag()
-            elif self.kind == BLOB:
+            elif self.kind is BLOB:
                 # might as well load into ram.... delete GitObjects you don't use, k?
                 self.data = self.raw.read()
             
@@ -190,11 +264,16 @@ class GitObject(object):
             return
         
         # begin loading
-        if not self.message and self.kind == COMMIT:
+        if not self.message and self.kind is COMMIT:
             self.raw.seek(5) # "tree "
             self.tree = self.raw.read(40)
-            self.raw.seek(self.raw.tell() + 8) # "\nparent "
-            self.parent = self.raw.read(40)
+            self.raw.seek(self.raw.tell() + 1) # "\n"
+            if self.raw.read(7) == "parent ":
+                self.parent = self.raw.read(40)
+            else:
+                # initial commit; there is no parent
+                self.parent = None
+                self.raw.seek(self.raw.tell() - 7)
             
             #self.raw.seek(self.raw.tell() + 8) # "\nauthor "
             #line = self.raw.readline()
