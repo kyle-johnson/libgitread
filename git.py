@@ -192,7 +192,7 @@ class GitObject(object):
     commitTime = None
     
     def __init__(self, sha1, gitDir, lazy=True):
-        print "######## " + sha1
+        #print "######## " + sha1
         self.dir = gitDir
         self.sha1 = sha1
         
@@ -245,10 +245,10 @@ class GitObject(object):
                 self.loadTag()
             elif self.kind is BLOB:
                 # might as well load into ram.... delete GitObjects you don't use, k?
-                self.data = self.raw.read()
+                self.data = self.raw
             
             if self.kind in (COMMIT, TAG, BLOB): # tree types don't return file objects!
-                self.raw.close()
+                del self.raw
             self.raw = None
             
 
@@ -265,15 +265,12 @@ class GitObject(object):
         
         # begin loading
         if not self.message and self.kind is COMMIT:
-            self.raw.seek(5) # "tree "
-            self.tree = self.raw.read(40)
-            self.raw.seek(self.raw.tell() + 1) # "\n"
-            if self.raw.read(7) == "parent ":
-                self.parent = self.raw.read(40)
+            self.tree = self.raw[5:45]
+            if self.raw[46:53] == "parent ":
+                self.parent = self.raw[53:93]
             else:
                 # initial commit; there is no parent
                 self.parent = None
-                self.raw.seek(self.raw.tell() - 7)
             
             #self.raw.seek(self.raw.tell() + 8) # "\nauthor "
             #line = self.raw.readline()
@@ -285,7 +282,7 @@ class GitObject(object):
             #self.commitTime = line[line.index('>')+2:len(line)-1]
             
             #self.raw.seek(self.raw.tell() + 1) # "\n"
-            self.message = self.raw.read() # get the rest
+            self.message = self.raw # get the rest
         
     def loadTag(self):
         pass

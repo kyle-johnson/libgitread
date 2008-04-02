@@ -126,6 +126,7 @@ void *patch_delta(const void *src_buf, unsigned long src_size,
 			// extensions. In the mean time we must fail when
 			// encountering them (might be data corruption).
             free(dst_buf);
+            //printf("++++ cmd == 0 in delta_patch\n");
             return NULL;
 		}
 	}
@@ -133,6 +134,8 @@ void *patch_delta(const void *src_buf, unsigned long src_size,
 	// sanity check
 	if (data != top || size != 0) {
 		free(dst_buf);
+        //printf("++++ sanity check failed in delta_patch\n");
+        //printf("     data = %i\n     top = %i\n     size = %i\n", (int) data, (int) top, (int)size);
 		return NULL;
 	}
 
@@ -146,17 +149,19 @@ void *patch_delta(const void *src_buf, unsigned long src_size,
 //
 // This must be called twice on the delta pack entry: first to get the
 // expected source size, and again to get the target size.
-static inline unsigned int get_delta_hdr_size(FILE *pack_fp)
+static inline unsigned int get_delta_hdr_size(unsigned char **datap)//FILE *pack_fp)
 {
+    unsigned char *data = *datap;
 	unsigned char cmd;
 	unsigned int size = 0;
 	int i = 0;
 	do {
-        fread(&cmd, 1, 1, pack_fp);
+        //fread(&cmd, 1, 1, pack_fp);
+        cmd = *data++;
 		size |= (cmd & ~0x80) << i;
 		i += 7;
     } while (cmd & 0x80); // && data < top);
-    
+    *datap = data;
 	return size;
 }
 
@@ -189,13 +194,14 @@ int pack_get_object(char * location, unsigned int offset, struct git_object * g_
     struct git_object base_object; // used for deltas
     unsigned char real_read_buffer[CHUNKSIZE], real_write_buffer[CHUNKSIZE]; // global to prevent stack overflow?
     unsigned char *read_buffer = real_read_buffer, *write_buffer = real_write_buffer;
-
+    unsigned char *obj_data = NULL;
+    
     int status;
     int amount_read = 0;
     unsigned int size = 0, type = 0, shift;
     unsigned int base_size = 0, result_size = 0; // used for deltas
     unsigned char byte;
-
+    
     int i;
     int file_position = 0;
     
@@ -203,7 +209,8 @@ int pack_get_object(char * location, unsigned int offset, struct git_object * g_
     g_obj->size = 0;
     g_obj->type = UKNOWNTYPE;
     g_obj->data = NULL;
-
+    g_obj->mem_data = NULL;
+    
     if(!(pack_fp = util_open_file_cached(location))) { //fopen(location, "r"))) {
         printf("!!!! failed to open pack file\n");
         return -1;
@@ -234,11 +241,12 @@ int pack_get_object(char * location, unsigned int offset, struct git_object * g_
         return 0;
     }
     
-    if(!(g_obj->data = tmpfile())) {
+    if(!(g_obj->mem_data = (unsigned char *) malloc(g_obj->size))) {//g_obj->data = tmpfile())) {
         util_close_file_cached(pack_fp);
         printf("!!!! failed to create tmpfile\n");
         return -1;
     }
+    obj_data = g_obj->mem_data;
     
     if(type == REF_DELTA) {
         // printf("==== REF_DELTA\n\n");
@@ -288,8 +296,11 @@ int pack_get_object(char * location, unsigned int offset, struct git_object * g_
         file_position = ftell(pack_fp);
 
         // get the base object
+        //printf("#### getting a delta\n");
         if(pack_get_object(location, pack_offset, &base_object, 1) != 0) {
             printf("!!!! failed to get the base object for a OFS_DELTA\n");
+            free(g_obj->mem_data);
+            g_obj->mem_data = NULL;
             util_close_file_cached(pack_fp);
             return -1;
         }
@@ -305,6 +316,8 @@ int pack_get_object(char * location, unsigned int offset, struct git_object * g_
     
     if((status = inflateInit(&zst)) != Z_OK) {
         util_close_file_cached(pack_fp);
+        free(g_obj->mem_data);
+        g_obj->mem_data = NULL;
         return status;
     }
     
@@ -314,62 +327,74 @@ int pack_get_object(char * location, unsigned int offset, struct git_object * g_
         if(ferror(pack_fp)) {
             inflateEnd(&zst);
             util_close_file_cached(pack_fp);
+            free(g_obj->mem_data);
+            g_obj->mem_data = NULL;
+            printf("==== ferror(pack_fp)\n");
             return -1;
         }
-        if(zst.avail_in == 0) { // eof
+        if(zst.avail_in == 0) { // eof ?
             util_close_file_cached(pack_fp);
+            free(g_obj->mem_data);
+            g_obj->mem_data = NULL;
+            printf("==== zst.avail_in == 0\n");
             return -1;
         }
         zst.next_in = read_buffer;
         
         // fill up the write buffer
         do {
-            zst.avail_out = CHUNKSIZE;
-            zst.next_out = write_buffer;
+            zst.avail_out = g_obj->size - (obj_data - g_obj->mem_data);//CHUNKSIZE;
+            zst.next_out = obj_data;//write_buffer;
             status = inflate(&zst, Z_NO_FLUSH);
-            assert(status != Z_STREAM_ERROR);
+
             switch(status) {
+                case Z_STREAM_ERROR:
                 case Z_NEED_DICT:
-                    status = Z_DATA_ERROR;
                 case Z_DATA_ERROR:
                 case Z_MEM_ERROR:
                     inflateEnd(&zst);
                     util_close_file_cached(pack_fp);
+                    free(g_obj->mem_data);
+                    g_obj->mem_data = NULL;
                     printf("=== zlib says: %i\n", status);
                     return status;
             }
      
-            amount_read = CHUNKSIZE - zst.avail_out;
+            amount_read = g_obj->size - ((obj_data - g_obj->mem_data) + zst.avail_out);//CHUNKSIZE - zst.avail_out;
             
-            if(fwrite(write_buffer, 1, amount_read, g_obj->data) != amount_read || ferror(g_obj->data)) {
+            obj_data += amount_read;
+            /*if(fwrite(write_buffer, 1, amount_read, g_obj->data) != amount_read || ferror(g_obj->data)) {
                 util_close_file_cached(pack_fp);
                 inflateEnd(&zst);
                 return -1;
-            }
-        } while(zst.avail_out == 0);
+            }*/
+        } while(zst.avail_out == 0 && status != Z_STREAM_END);
     } while (status != Z_STREAM_END);
     inflateEnd(&zst);
     util_close_file_cached(pack_fp);
 
+    obj_data = g_obj->mem_data;
+
     if(type == REF_DELTA || type == OFS_DELTA) {
-        fseek(g_obj->data, 0, SEEK_SET);
+        //fseek(g_obj->data, 0, SEEK_SET);
         
         // have to get these two sizes before decompression
-        base_size = get_delta_hdr_size(g_obj->data);
-        result_size = get_delta_hdr_size(g_obj->data);
+        base_size = get_delta_hdr_size(&obj_data);
+        result_size = get_delta_hdr_size(&obj_data);
         
         // needed 'since those two hdr_sizes are included in the delta size
-        size -= ftell(g_obj->data);
+        size -= obj_data - g_obj->mem_data;//ftell(g_obj->data);
+        //printf("-+-+ offset: %i\n     obj_data: %i\n     mem_data: %i\n", (int) (obj_data - g_obj->mem_data), (int) obj_data, (int) g_obj->mem_data);
         
         g_obj->type = base_object.type;
         g_obj->size = result_size;
 
-        if(!(delta_fp = tmpfile())) {
-            fclose(g_obj->data);
-            fclose(base_object.data);
+        /*if(!(delta_fp = tmpfile())) {
+            free(g_obj->mem_data);//fclose(g_obj->data);
+            free(base_object.mem_data);//fclose(base_object.data);
             return -1;
-        }
-                
+        }*/
+
         // at this point, we have the two pieces of data to make the result:
         // 1) g_obj->data is the delta data
         // 2) base_object.data is the base data
@@ -379,36 +404,37 @@ int pack_get_object(char * location, unsigned int offset, struct git_object * g_
         // result_size = result size
         {
             unsigned char *delta_buffer, *base_buffer, *result_buffer;
-            delta_buffer = (unsigned char *) malloc(size);
-            base_buffer = (unsigned char *) malloc(base_size);
+            //delta_buffer = (unsigned char *) malloc(size);
+            //base_buffer = (unsigned char *) malloc(base_size);
             
-            // fseek(g_obj->data, 0, SEEK_SET);
-            fseek(base_object.data, 0, SEEK_SET);
+            //fseek(base_object.data, 0, SEEK_SET);
             
-            fread(delta_buffer, 1, size, g_obj->data);
-            fread(base_buffer, 1, base_size, base_object.data);
+            delta_buffer = obj_data;//fread(delta_buffer, 1, size, g_obj->data);
+            base_buffer = base_object.mem_data;//fread(base_buffer, 1, base_size, base_object.data);
 
-            fclose(g_obj->data);
-            fclose(base_object.data);
+            //fclose(g_obj->data);
+            //fclose(base_object.data);
             
             result_buffer = (unsigned char *) patch_delta(base_buffer, base_size, delta_buffer, size, result_size);
-            free(delta_buffer);
-            free(base_buffer);
+            //free(delta_buffer);
+            //free(base_buffer);
             if(result_buffer == NULL) {
+                printf("==== result_buffer == NULL\n");
                 return -1;
             }
             
             // copy result buffer to a file
-            if(!(g_obj->data = tmpfile())) {
-                free(result_buffer);
-                return -1;
-            }
-            fwrite(result_buffer, 1, result_size, g_obj->data);
-            free(result_buffer);
+            //if(!(g_obj->data = tmpfile())) {
+            //    free(result_buffer);
+            //    return -1;
+            //}
+            //fwrite(result_buffer, 1, result_size, g_obj->data);
+            //free(result_buffer);
+            g_obj->mem_data = result_buffer;
         }
     }
 
-    fseek(g_obj->data, 0, SEEK_SET);
+    //fseek(g_obj->data, 0, SEEK_SET);
     return 0;
 }
 
@@ -475,10 +501,10 @@ int loose_get_object(char * location, struct git_object * g_obj, int full)
     FILE *loose_fp = NULL;
     FILE *tmp = NULL;
     unsigned char real_read_buffer[CHUNKSIZE];
-    unsigned char real_write_buffer[CHUNKSIZE];
+    unsigned char real_small_write_buffer[128]; //CHUNKSIZE];
     unsigned char *read_buffer = real_read_buffer;
-    unsigned char *write_buffer = real_write_buffer;
-    unsigned char *c_ptr = NULL;
+    unsigned char *small_write_buffer = real_small_write_buffer;
+    unsigned char *c_ptr = NULL, *obj_data = NULL;
 
     int status;
     int amount_read = 0;
@@ -492,9 +518,10 @@ int loose_get_object(char * location, struct git_object * g_obj, int full)
     g_obj->size = 0;
     g_obj->type = UKNOWNTYPE;
     g_obj->data = NULL;
+    g_obj->mem_data = NULL;
 
     zst.zalloc = Z_NULL; // use defaults
-    zst.zfree = Z_NULL; // ''
+    zst.zfree = Z_NULL;  // ''
     zst.opaque = Z_NULL;
     zst.avail_in = 0;
     zst.next_in = Z_NULL;
@@ -515,7 +542,7 @@ int loose_get_object(char * location, struct git_object * g_obj, int full)
             fclose(loose_fp);
             return -1;
         }
-        if(zst.avail_in == 0) { // eof
+        if(zst.avail_in == 0) { // eof ?
             fclose(loose_fp);
             return -1;
         }
@@ -523,13 +550,21 @@ int loose_get_object(char * location, struct git_object * g_obj, int full)
         
         // fill up the write buffer
         do {
-            zst.avail_out = CHUNKSIZE;
-            zst.next_out = write_buffer;
+            if(g_obj->mem_data == NULL) {
+                // we are just trying to get the type and size right now, so we use a small buffer
+                zst.avail_out = 128;
+                zst.next_out = small_write_buffer;
+            } else {
+                // okay, now we are really goin' to town...
+                zst.avail_out = g_obj->size - (obj_data - g_obj->mem_data); //amount_read; // already read some of the data...
+                zst.next_out = obj_data;
+            }
+            
+            // error check
             status = inflate(&zst, Z_NO_FLUSH);
-            assert(status != Z_STREAM_ERROR);
             switch(status) {
+                case Z_STREAM_ERROR:
                 case Z_NEED_DICT:
-                    status = Z_DATA_ERROR;
                 case Z_DATA_ERROR:
                 case Z_MEM_ERROR:
                     inflateEnd(&zst);
@@ -537,79 +572,81 @@ int loose_get_object(char * location, struct git_object * g_obj, int full)
                     return status;
             }
      
-            amount_read = CHUNKSIZE - zst.avail_out;
-            if(amount_read >= 6 && find_type) {
-                // we have enough data to find out the type
-                if(memcmp("blob", write_buffer, 4) == 0) {
-                    g_obj->type = BLOB;
-                } else if(memcmp("commit", write_buffer, 6) == 0) {
-                    g_obj->type = COMMIT;
-                    full = 1;
-                } else if(memcmp("tree", write_buffer, 4) == 0) {
-                    g_obj->type = TREE;
-                    full = 1;
-                } else if(memcmp("tag", write_buffer, 3) == 0) {
-                    g_obj->type = TAG;
-                } else {
-                    g_obj->type = UKNOWNTYPE;
+            if(g_obj->mem_data == NULL)
+                amount_read = 128 - zst.avail_out;
+            else
+                amount_read = g_obj->size - ((obj_data - g_obj->mem_data) + zst.avail_out);
+            
+            // Yes, we actually check for an amount read even though we do little
+            // other error checking and it SHOULD be correct. :)
+            if(amount_read >= 6 && (find_type || find_size)) {
+                if(find_type) {
+                    // we have enough data to find out the type
+                    if(memcmp("blob", small_write_buffer, 4) == 0) {
+                        g_obj->type = BLOB;
+                    } else if(memcmp("commit", small_write_buffer, 6) == 0) {
+                        g_obj->type = COMMIT;
+                        full = 1;
+                    } else if(memcmp("tree", small_write_buffer, 4) == 0) {
+                        g_obj->type = TREE;
+                        full = 1;
+                    } else if(memcmp("tag", small_write_buffer, 3) == 0) {
+                        g_obj->type = TAG;
+                    } else {
+                        g_obj->type = UKNOWNTYPE;
+                    }
+                    find_type = 0;
                 }
-                find_type = 0;
-                
-                if(full) {
-                    if(!(g_obj->data = tmpfile())) {
-                        // can't make a temporary file for the data
-                        fclose(loose_fp);
-                        inflateEnd(&zst);
-                        return -1;
+                if(find_size) {
+                    // \0 comes after the size
+                    //c_ptr = (unsigned char*) memchr(small_write_buffer, '\0', amount_read);
+                    // find the space that comes before the size
+                    c_ptr = (unsigned char*) memchr(small_write_buffer, ' ', amount_read);
+                    g_obj->size = atoi((char *) c_ptr);
+                    find_size = 0;
+                    
+                    if(full) {
+                        if(!(g_obj->mem_data = (unsigned char *) malloc(g_obj->size))) {
+                            // can't allocate space for the data
+                            fclose(loose_fp);
+                            inflateEnd(&zst);
+                            return -1;
+                        }
+                        obj_data = g_obj->mem_data; // setup the utility pointer
                     }
                 }
             }
-            if(amount_read >= 6 && find_size) {
-                // we might have enough to find the size...
-                if(c_ptr = (unsigned char*) memchr(write_buffer, '\0', amount_read)) {
-                    // now find the space that comes before the end of the size
-                    c_ptr = (unsigned char*) memchr(write_buffer, ' ', amount_read);
-                    g_obj->size = atoi((char *) c_ptr);
-                    find_size = 0;
-                }
-            }
             
-            // We ASSUME that on the first loop, we have AT LEAST figured out the type
-            // and size of the object.
-            //
-            // If this doesn't work, a larger CHUNKSIZE should fix the problem.
-            if(full) {
-                if(ftell(g_obj->data) == 0) {
-                    c_ptr = (unsigned char*) memchr(write_buffer, '\0', amount_read) + 1;
-                    fwrite(c_ptr, 1, amount_read - (c_ptr - write_buffer), g_obj->data);
-                } else {
-                    fwrite(write_buffer, 1, amount_read, g_obj->data);
-                }
+            // Write out lingering data from the first time through reading.
+            // After this write, zlib will write directly to obj_data itself.
+            if(full && g_obj->mem_data - obj_data == 0) {
+                // we are at the start, so at this point:
+                // 1) we have data in a buffer
+                // 2) some of that data we need to discard (up to and including the \0)
+                c_ptr = (unsigned char*) memchr(small_write_buffer, '\0', amount_read) + 1;
+                memcpy(obj_data, c_ptr, amount_read - (c_ptr - small_write_buffer));
+                obj_data += (amount_read - (c_ptr - small_write_buffer));
                 
-                if(ferror(g_obj->data)) {
-                //if(fwrite(write_buffer, 1, amount_read, g_obj->data) != amount_read || ferror(g_obj->data)) {
-                    fclose(loose_fp);
-                    inflateEnd(&zst);
-                    return -1;
-                }
-            } else {
-                // we should be done; clean up and return
+                // fwrite(c_ptr, 1, amount_read - (c_ptr - write_buffer), g_obj->data);
+            } else if(full) {
+                // update the pointer so we don't overwrite anything
+                obj_data += amount_read;
+            } else if(!full) {
+                // all they wanted was the type and size; clean up and return
                 fclose(loose_fp);
                 inflateEnd(&zst);
                 return 0;
             }
-        } while(zst.avail_out == 0);
+        } while(zst.avail_out == 0 && status != Z_STREAM_END);
     } while (status != Z_STREAM_END);
     inflateEnd(&zst);
     fclose(loose_fp);
     
-    fseek(g_obj->data, 0, SEEK_SET);
     return 0;
 }
-
-/*static int main(int argc, char *argv[])
+///*
+int main(int argc, char *argv[])
 {
-    
     //struct idx_entry * entry = NULL;
     
     //entry = pack_idx_read("/Users/kylejohnson/vector/cairo/.git/objects/pack/pack-4a32c03738a275d48dfb8927d44ccf3bbe1c1713.idx",
@@ -618,11 +655,12 @@ int loose_get_object(char * location, struct git_object * g_obj, int full)
     //    printf("sha1: %s\n", entry->sha1);
     //    printf("offset: %i\n", entry->offset);
     //}
-    
-    
+
+
     struct git_object g_obj;
-    
-    printf("exit: %i\n\n", pack_get_object("/Users/kylejohnson/vector/cairo/.git/objects/pack/pack-4a32c03738a275d48dfb8927d44ccf3bbe1c1713.pack", (argc > 1)? atoi(argv[1]): 1207716, &g_obj, (argc > 2)? 1:0) );
+
+    printf("exit: %i\n\n", pack_get_object("/Users/kylejohnson/vector/cairo/.git/objects/pack/pack-4a32c03738a275d48dfb8927d44ccf3bbe1c1713.pack", (argc > 2)? atoi(argv[2]) : 1207716, &g_obj, (argc > 1)? 1:0));
+    //loose_get_object("/Users/kylejohnson/pygitlib/.git/objects/2f/838d9ee515c7004d4c4bc1a35b5aba18668f45", &g_obj, (argc > 1)? 1:0) );
     switch(g_obj.type) {
         case COMMIT:
             printf("type is commit\n");
@@ -640,8 +678,11 @@ int loose_get_object(char * location, struct git_object * g_obj, int full)
             printf("type is unknown: %i\n", g_obj.type);
     }
     printf("size is: %i\n", g_obj.size);
-    if(g_obj.data != NULL)
+    if(g_obj.mem_data != NULL) {
         printf("data object exists!\n\n");
+        printf("%s\n-----------\n", g_obj.mem_data);
+    }
+
 
     return 0;
-}*/
+}/**/

@@ -10,26 +10,19 @@ static PyObject *raw_tree_to_pyobject(struct git_object *g_obj)
     PyObject *pysha1;
     PyObject *pyint;
     
-    if(!(source_internal_buffer = (unsigned char *) malloc(g_obj->size)))
+    if(!(pylist = PyList_New(0)))
         return NULL;
     
-    if(!(pylist = PyList_New(0))) {
-        free(source_internal_buffer);
-        return NULL;
-    }
-    
-    fseek(g_obj->data, 0, SEEK_SET);
-    fread(source_internal_buffer, 1, g_obj->size, g_obj->data);
-    src_buff = source_internal_buffer;
+    //fseek(g_obj->data, 0, SEEK_SET);
+    //fread(source_internal_buffer, 1, g_obj->size, g_obj->data);
+    src_buff = g_obj->mem_data;
     
     end = (unsigned char *) src_buff + g_obj->size;
     
     while(src_buff < end) {
         // each list entry is a tuple with three parts: (mode, sha1, name)
-        if(!(pytuple = PyTuple_New(3))) {
-            free(source_internal_buffer);
+        if(!(pytuple = PyTuple_New(3)))
             return NULL;
-        }
         
         pyint = PyInt_FromLong((long) atoi((char *) src_buff));
         src_buff = memchr(src_buff, ' ', 10); // find the space between the mode and the filename
@@ -68,7 +61,7 @@ static PyObject *raw_tree_to_pyobject(struct git_object *g_obj)
         }
     }
     
-    free(source_internal_buffer);
+    //free(source_internal_buffer);
     
     return pylist;
 }
@@ -81,6 +74,7 @@ static PyObject *gu_pack_get_object(PyObject *self, PyObject *args)
     struct git_object g_obj;
     int ret;
     PyObject *pytree;
+    PyObject *retObj;
 
     if(!PyArg_ParseTuple(args, "si|i", &location, &offset, &full))
         return NULL;
@@ -88,17 +82,20 @@ static PyObject *gu_pack_get_object(PyObject *self, PyObject *args)
     ret = pack_get_object(location, offset, &g_obj, full);
     
     if(ret != 0) {
+        printf("!!!! %i", ret);
         PyErr_SetString(PyExc_Exception, "error occured while getting a packed object; perhaps the pack file doesn't exist or is corrupt.");
         return NULL;
     }
     
-    if(g_obj.data != NULL) {
+    if(g_obj.mem_data != NULL) {
         if(g_obj.type == TREE) {
             pytree = raw_tree_to_pyobject(&g_obj);
-            fclose(g_obj.data); // we have to do this ourselves, just in case the previous call errored out
+            free(g_obj.mem_data);//fclose(g_obj.data); // we have to do this ourselves, just in case the previous call errored out
             return Py_BuildValue("iiO", g_obj.type, g_obj.size, pytree);
         }
-        return Py_BuildValue("iiS", g_obj.type, g_obj.size, PyFile_FromFile(g_obj.data, "temporary", "wr", NULL));
+        retObj = Py_BuildValue("iiO", g_obj.type, g_obj.size, PyString_FromStringAndSize((char *) g_obj.mem_data, g_obj.size));
+        free(g_obj.mem_data);
+        return retObj;
     } else {
         return Py_BuildValue("iiO", g_obj.type, g_obj.size, Py_None);
     }
@@ -111,6 +108,7 @@ static PyObject *gu_loose_get_object(PyObject *self, PyObject *args)
     struct git_object g_obj;
     int ret;
     PyObject *pytree;
+    PyObject *retObj;
 
     if(!PyArg_ParseTuple(args, "s|i", &location, &full))
         return NULL;
@@ -122,13 +120,15 @@ static PyObject *gu_loose_get_object(PyObject *self, PyObject *args)
         return NULL;
     }
     
-    if(g_obj.data != NULL) {
+    if(g_obj.mem_data != NULL) {
         if(g_obj.type == TREE) {
             pytree = raw_tree_to_pyobject(&g_obj);
-            fclose(g_obj.data); // we have to do this ourselves, just in case the previous call errored out
+            free(g_obj.mem_data);//fclose(g_obj.data); // we have to do this ourselves, just in case the previous call errored out
             return Py_BuildValue("iiO", g_obj.type, g_obj.size, pytree);
         }
-        return Py_BuildValue("iiS", g_obj.type, g_obj.size, PyFile_FromFile(g_obj.data, "temporary", "wr", NULL));
+        retObj = Py_BuildValue("iiO", g_obj.type, g_obj.size, PyString_FromStringAndSize((char *) g_obj.mem_data, g_obj.size));
+        free(g_obj.mem_data);
+        return retObj;
     } else {
         return Py_BuildValue("iiO", g_obj.type, g_obj.size, Py_None);
     }

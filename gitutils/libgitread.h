@@ -29,6 +29,7 @@ struct git_object {
     unsigned int type;
     unsigned int size;
     FILE *data;
+    unsigned char* mem_data;
 };
 
 int bin_tree_to_ascii_tree(struct git_object *g_obj);
