@@ -1,10 +1,6 @@
 #ifndef LIBGITREAD_H
 #define LIBGITREAD_H
 
-#include <stdlib.h>
-#include <stdio.h>
-#include <string.h>
-
 // defined in git's cache.h
 #define UKNOWNTYPE -1 // aka: OBJ_BAD
 #define COMMIT  1

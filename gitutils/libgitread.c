@@ -1,7 +1,11 @@
-#include "libgitread.h"
+#include <stdlib.h>
+#include <stdio.h>
+#include <string.h>
 #include <assert.h>
-
 #include <zlib.h>
+
+#include "libgitread.h"
+#include "filecache.h"
 
 #define CHUNKSIZE (1024*4)
 
@@ -193,14 +197,17 @@ int pack_get_object(char * location, unsigned int offset, struct git_object * g_
     unsigned char byte;
 
     int i;
+    int file_position = 0;
     
     // initialize
     g_obj->size = 0;
     g_obj->type = UKNOWNTYPE;
     g_obj->data = NULL;
 
-    if(!(pack_fp = fopen(location, "r")))
+    if(!(pack_fp = util_open_file_cached(location))) { //fopen(location, "r"))) {
+        printf("!!!! failed to open pack file\n");
         return -1;
+    }
     
     // move to the entry
     fseek(pack_fp, offset, SEEK_SET);
@@ -223,17 +230,18 @@ int pack_get_object(char * location, unsigned int offset, struct git_object * g_
     
     // they just need the type/size
     if(!full && type == BLOB) {
-        fclose(pack_fp);
+        util_close_file_cached(pack_fp);
         return 0;
     }
     
     if(!(g_obj->data = tmpfile())) {
-        fclose(pack_fp);
+        util_close_file_cached(pack_fp);
+        printf("!!!! failed to create tmpfile\n");
         return -1;
     }
     
     if(type == REF_DELTA) {
-        printf("==== REF_DELTA\n\n");
+        // printf("==== REF_DELTA\n\n");
         struct idx_entry *base_idx;
         
         char * sha1;
@@ -245,7 +253,7 @@ int pack_get_object(char * location, unsigned int offset, struct git_object * g_
         
         // find the offset from the index file
         if(!(idx_location = (char *) malloc(sizeof(char)*strlen(location)))) {
-            fclose(pack_fp);
+            util_close_file_cached(pack_fp);
             return -1;
         }
         memcpy(idx_location, location, strlen(location) - 4);  // remove "pack" extension
@@ -253,18 +261,18 @@ int pack_get_object(char * location, unsigned int offset, struct git_object * g_
         base_idx = pack_idx_read(idx_location, sha1);
         free(idx_location);
         if(base_idx == NULL) {
-            fclose(pack_fp);
+            util_close_file_cached(pack_fp);
             return -1;
         }
         
         // get the base object
         if(pack_get_object(location, base_idx->offset, &base_object, 1) != 0) {
             free(base_idx);
-            fclose(pack_fp);
+            util_close_file_cached(pack_fp);
             return -1;
         }
     } else if(type == OFS_DELTA) {
-        printf("==== OFS_DELTA\n\n");
+        //printf("==== OFS_DELTA\n\n");
         
         unsigned int pack_offset;
         fread(&byte, 1, 1, pack_fp);
@@ -276,11 +284,17 @@ int pack_get_object(char * location, unsigned int offset, struct git_object * g_
         }
         pack_offset = offset - pack_offset;
 
+        // save file location
+        file_position = ftell(pack_fp);
+
         // get the base object
         if(pack_get_object(location, pack_offset, &base_object, 1) != 0) {
-            fclose(pack_fp);
+            printf("!!!! failed to get the base object for a OFS_DELTA\n");
+            util_close_file_cached(pack_fp);
             return -1;
         }
+        // reset file position
+        fseek(pack_fp, file_position, SEEK_SET);
     }    
     
     zst.zalloc = Z_NULL; // use defaults
@@ -290,7 +304,7 @@ int pack_get_object(char * location, unsigned int offset, struct git_object * g_
     zst.next_in = Z_NULL;
     
     if((status = inflateInit(&zst)) != Z_OK) {
-        fclose(pack_fp);
+        util_close_file_cached(pack_fp);
         return status;
     }
     
@@ -299,11 +313,11 @@ int pack_get_object(char * location, unsigned int offset, struct git_object * g_
         zst.avail_in = fread(read_buffer, 1, CHUNKSIZE, pack_fp);
         if(ferror(pack_fp)) {
             inflateEnd(&zst);
-            fclose(pack_fp);
+            util_close_file_cached(pack_fp);
             return -1;
         }
         if(zst.avail_in == 0) { // eof
-            fclose(pack_fp);
+            util_close_file_cached(pack_fp);
             return -1;
         }
         zst.next_in = read_buffer;
@@ -320,7 +334,7 @@ int pack_get_object(char * location, unsigned int offset, struct git_object * g_
                 case Z_DATA_ERROR:
                 case Z_MEM_ERROR:
                     inflateEnd(&zst);
-                    fclose(pack_fp);
+                    util_close_file_cached(pack_fp);
                     printf("=== zlib says: %i\n", status);
                     return status;
             }
@@ -328,14 +342,14 @@ int pack_get_object(char * location, unsigned int offset, struct git_object * g_
             amount_read = CHUNKSIZE - zst.avail_out;
             
             if(fwrite(write_buffer, 1, amount_read, g_obj->data) != amount_read || ferror(g_obj->data)) {
-                fclose(pack_fp);
+                util_close_file_cached(pack_fp);
                 inflateEnd(&zst);
                 return -1;
             }
         } while(zst.avail_out == 0);
     } while (status != Z_STREAM_END);
     inflateEnd(&zst);
-    fclose(pack_fp);
+    util_close_file_cached(pack_fp);
 
     if(type == REF_DELTA || type == OFS_DELTA) {
         fseek(g_obj->data, 0, SEEK_SET);
