@@ -109,6 +109,7 @@ class Git(object):
             # 4) Go forward one commit and return it.
             
             def build_tree(path, tree):
+                #print "building a tree"
                 pathSha1s = []
                 for i in range(len(path)):
                     for mode, sha1, name in tree:

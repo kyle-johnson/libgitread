@@ -15,14 +15,22 @@
 
 #define IDX_VERSION_TWO_SIG 0xff744f63 // '\377tOc'
 
-struct idx_v1_entry { // file format
-    unsigned char offset[4];
+struct sha1 {
     unsigned char sha1[20];
+    unsigned short length;
 };
 
-struct idx_entry { // nice format
-    unsigned int offset;
-    unsigned char sha1[40];
+struct idx {
+    char *location;
+    unsigned char *data;
+    int version;
+    size_t size;
+    uint32_t entries;
+};
+
+struct idx_entry {
+    uint32_t offset;
+    unsigned char sha1[20];
 };
 
 struct git_object {
@@ -32,13 +40,19 @@ struct git_object {
     unsigned char* mem_data;
 };
 
-int bin_tree_to_ascii_tree(struct git_object *g_obj);
+int get_sha1_hex(const char *hex, unsigned char *sha1);
+inline int str_sha1_to_sha1_obj(const char *str_sha1, struct sha1 *obj_sha1);
 char * sha1_to_hex(const unsigned char * sha1);
+void *patch_delta(const void *src_buf, unsigned long src_size,
+		  const void *delta_buf, unsigned long delta_size,
+          unsigned long dst_size);
 int pack_get_object(char * location,
                     unsigned int offset,
                     struct git_object * g_obj,
                     int full);
-struct idx_entry * pack_idx_read(char * location, char * sha1);
+void unload_idx(struct idx *idx);
+struct idx * load_idx(char *location);
+struct idx_entry * pack_idx_read(const struct idx *index, const struct sha1 *hash);
 int loose_get_object(char * location, struct git_object * g_obj, int full);
 
 

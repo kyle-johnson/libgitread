@@ -40,6 +40,9 @@ static PyObject *raw_tree_to_pyobject(struct git_object *g_obj)
             printf("ZOMG!!!! REALLY BAD!!!! 1\n\n\n");
             return NULL;
         }
+        //if(pyint != NULL)
+        //    Py_DECREF(pyint);
+        
         if(pysha1 == NULL)
             Py_INCREF(Py_None);
         if(PyTuple_SetItem(pytuple, 1, (pysha1 != NULL) ? pysha1 : Py_None) != 0) {
@@ -47,6 +50,9 @@ static PyObject *raw_tree_to_pyobject(struct git_object *g_obj)
             printf("ZOMG!!!! REALLY BAD!!!! 2 \n\n\n");
             return NULL;
         }
+        //if(pysha1 != NULL)
+        //    Py_DECREF(pysha1);
+        
         if(pyfilename == NULL)
             Py_INCREF(Py_None);
         if(PyTuple_SetItem(pytuple, 2, (pyfilename != NULL) ? pyfilename : Py_None) != 0) {
@@ -54,11 +60,14 @@ static PyObject *raw_tree_to_pyobject(struct git_object *g_obj)
             printf("ZOMG!!!! REALLY BAD!!!! 3\n\n\n");
             return NULL;
         }
+        //if(pyfilename != NULL)
+        //    Py_DECREF(pyfilename);
         
         if(PyList_Append(pylist, pytuple) != 0) {
             printf("Umm, can't insert the tuple into the list???");
             return NULL;
         }
+        Py_DECREF(pytuple);
     }
     
     //free(source_internal_buffer);
@@ -75,6 +84,7 @@ static PyObject *gu_pack_get_object(PyObject *self, PyObject *args)
     int ret;
     PyObject *pytree;
     PyObject *retObj;
+    PyObject *buffstr;
 
     if(!PyArg_ParseTuple(args, "si|i", &location, &offset, &full))
         return NULL;
@@ -91,9 +101,13 @@ static PyObject *gu_pack_get_object(PyObject *self, PyObject *args)
         if(g_obj.type == TREE) {
             pytree = raw_tree_to_pyobject(&g_obj);
             free(g_obj.mem_data);//fclose(g_obj.data); // we have to do this ourselves, just in case the previous call errored out
-            return Py_BuildValue("iiO", g_obj.type, g_obj.size, pytree);
+            retObj = Py_BuildValue("iiO", g_obj.type, g_obj.size, pytree);
+            Py_DECREF(pytree);
+            return retObj;
         }
-        retObj = Py_BuildValue("iiO", g_obj.type, g_obj.size, PyString_FromStringAndSize((char *) g_obj.mem_data, g_obj.size));
+        buffstr =  PyString_FromStringAndSize((char *) g_obj.mem_data, g_obj.size);
+        retObj = Py_BuildValue("iiO", g_obj.type, g_obj.size, buffstr);
+        Py_DECREF(buffstr); // this function is done messing with it, so it needs to give up its reference for proper gc
         free(g_obj.mem_data);
         return retObj;
     } else {
@@ -109,6 +123,7 @@ static PyObject *gu_loose_get_object(PyObject *self, PyObject *args)
     int ret;
     PyObject *pytree;
     PyObject *retObj;
+    PyObject *buffstr;
 
     if(!PyArg_ParseTuple(args, "s|i", &location, &full))
         return NULL;
@@ -124,9 +139,13 @@ static PyObject *gu_loose_get_object(PyObject *self, PyObject *args)
         if(g_obj.type == TREE) {
             pytree = raw_tree_to_pyobject(&g_obj);
             free(g_obj.mem_data);//fclose(g_obj.data); // we have to do this ourselves, just in case the previous call errored out
-            return Py_BuildValue("iiO", g_obj.type, g_obj.size, pytree);
+            retObj = Py_BuildValue("iiO", g_obj.type, g_obj.size, pytree);
+            Py_DECREF(pytree);
+            return retObj;
         }
-        retObj = Py_BuildValue("iiO", g_obj.type, g_obj.size, PyString_FromStringAndSize((char *) g_obj.mem_data, g_obj.size));
+        buffstr = PyString_FromStringAndSize((char *) g_obj.mem_data, g_obj.size);
+        retObj = Py_BuildValue("iiO", g_obj.type, g_obj.size, buffstr);
+        Py_DECREF(buffstr);
         free(g_obj.mem_data);
         return retObj;
     } else {
@@ -139,13 +158,23 @@ static PyObject *gu_pack_idx_read(PyObject *self, PyObject *args)
     char *location;
     char *sha1;
     struct idx_entry *entry;
+    struct idx *idx;
+    struct sha1 hash;
     PyObject *ret;
     
     if(!PyArg_ParseTuple(args, "ss", &location, &sha1))
         return NULL;
 
-    entry = pack_idx_read(location, sha1);
-        
+    if(str_sha1_to_sha1_obj(sha1, &hash) != 0)
+        return NULL;
+    
+    if(!(idx = load_idx(location)))
+        return NULL;
+
+    entry = pack_idx_read(idx, &hash);
+    
+    unload_idx(idx);
+    
     if(entry != NULL) {
         ret = Py_BuildValue("is", entry->offset, entry->sha1);
         free(entry);

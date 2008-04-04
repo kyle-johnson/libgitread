@@ -1,7 +1,12 @@
 #include <stdlib.h>
 #include <stdio.h>
+#include <stdint.h>
+#include <sys/types.h>
+#include <sys/stat.h>
+#include <sys/mman.h>
+#include <fcntl.h>
+#include <netinet/in.h> // for ntohl(), etc
 #include <string.h>
-#include <assert.h>
 #include <zlib.h>
 
 #include "libgitread.h"
@@ -9,47 +14,64 @@
 
 #define CHUNKSIZE (1024*4)
 
-// Since some scripting languages have issues with binary sha1 digests
-// and strings with null charactres, this function is provided to turn
-// a git_objec.data file for a tree into a pure-ascii representation.
-// One tree entry per line:
-//      mode name sha1
-int bin_tree_to_ascii_tree(struct git_object *g_obj)
+const signed char hexval_table[256] = {
+	 -1, -1, -1, -1, -1, -1, -1, -1,		/* 00-07 */
+	 -1, -1, -1, -1, -1, -1, -1, -1,		/* 08-0f */
+	 -1, -1, -1, -1, -1, -1, -1, -1,		/* 10-17 */
+	 -1, -1, -1, -1, -1, -1, -1, -1,		/* 18-1f */
+	 -1, -1, -1, -1, -1, -1, -1, -1,		/* 20-27 */
+	 -1, -1, -1, -1, -1, -1, -1, -1,		/* 28-2f */
+	  0,  1,  2,  3,  4,  5,  6,  7,		/* 30-37 */
+	  8,  9, -1, -1, -1, -1, -1, -1,		/* 38-3f */
+	 -1, 10, 11, 12, 13, 14, 15, -1,		/* 40-47 */
+	 -1, -1, -1, -1, -1, -1, -1, -1,		/* 48-4f */
+	 -1, -1, -1, -1, -1, -1, -1, -1,		/* 50-57 */
+	 -1, -1, -1, -1, -1, -1, -1, -1,		/* 58-5f */
+	 -1, 10, 11, 12, 13, 14, 15, -1,		/* 60-67 */
+	 -1, -1, -1, -1, -1, -1, -1, -1,		/* 68-67 */
+	 -1, -1, -1, -1, -1, -1, -1, -1,		/* 70-77 */
+	 -1, -1, -1, -1, -1, -1, -1, -1,		/* 78-7f */
+	 -1, -1, -1, -1, -1, -1, -1, -1,		/* 80-87 */
+	 -1, -1, -1, -1, -1, -1, -1, -1,		/* 88-8f */
+	 -1, -1, -1, -1, -1, -1, -1, -1,		/* 90-97 */
+	 -1, -1, -1, -1, -1, -1, -1, -1,		/* 98-9f */
+	 -1, -1, -1, -1, -1, -1, -1, -1,		/* a0-a7 */
+	 -1, -1, -1, -1, -1, -1, -1, -1,		/* a8-af */
+	 -1, -1, -1, -1, -1, -1, -1, -1,		/* b0-b7 */
+	 -1, -1, -1, -1, -1, -1, -1, -1,		/* b8-bf */
+	 -1, -1, -1, -1, -1, -1, -1, -1,		/* c0-c7 */
+	 -1, -1, -1, -1, -1, -1, -1, -1,		/* c8-cf */
+	 -1, -1, -1, -1, -1, -1, -1, -1,		/* d0-d7 */
+	 -1, -1, -1, -1, -1, -1, -1, -1,		/* d8-df */
+	 -1, -1, -1, -1, -1, -1, -1, -1,		/* e0-e7 */
+	 -1, -1, -1, -1, -1, -1, -1, -1,		/* e8-ef */
+	 -1, -1, -1, -1, -1, -1, -1, -1,		/* f0-f7 */
+	 -1, -1, -1, -1, -1, -1, -1, -1,		/* f8-ff */
+};
+
+static inline unsigned int hexval(unsigned char c)
 {
-    unsigned char *source_internal_buffer, *src_buff,
-                  *end, *pos;
-    char *sha1;
+	return hexval_table[c];
+}
+
+// Works with short hex strings too!
+// (Just note that in the case of an odd number of hex characters,
+// the last character will be discarded.)
+int get_sha1_hex(const char *hex, unsigned char *sha1)
+{
+	int i;
+    unsigned int val;
+    int len = strlen(hex) / 2;
+    //int odd_or_even = len % 2;
     
-    if(!(source_internal_buffer = (unsigned char *) malloc(g_obj->size)))
-        return -1;
-    
-    fseek(g_obj->data, 0, SEEK_SET);
-    fread(source_internal_buffer, 1, g_obj->size, g_obj->data);
-    src_buff = source_internal_buffer;
-    fclose(g_obj->data);
-    
-    if(!(g_obj->data = tmpfile())) {
-        free(source_internal_buffer);
-        return -2;
+    for(i = 0; i < len; i++) {
+        val = (hexval(hex[0]) << 4) | hexval(hex[1]);
+		if (val & ~0xff)
+			return -1;
+		*sha1++ = val;
+		hex += 2;
     }
-    
-    end = (unsigned char *) src_buff + g_obj->size;
-    
-    while(src_buff < end) {
-        pos = memchr(src_buff, '\0', 1024); // get the mode and filename
-        fwrite(src_buff, 1, pos - src_buff, g_obj->data);
-        fwrite(" ", 1, 1, g_obj->data);
-        src_buff = (unsigned char *) pos + 1;
-        
-        sha1 = sha1_to_hex(src_buff);
-        fwrite(sha1, 1, 40, g_obj->data);
-        fwrite("\n", 1, 1, g_obj->data);
-        src_buff += 20;
-    }
-    fseek(g_obj->data, 0, SEEK_SET);
-    free(source_internal_buffer);
-    
-    return 0;
+	return 0;
 }
 
 // Taken directly from sha1_file.c from git v 1.5.5
@@ -204,6 +226,8 @@ int pack_get_object(char * location, unsigned int offset, struct git_object * g_
     
     int i;
     int file_position = 0;
+    
+    //printf("%i\n", (int) offset);
     
     // initialize
     g_obj->size = 0;
@@ -416,8 +440,8 @@ int pack_get_object(char * location, unsigned int offset, struct git_object * g_
             //fclose(base_object.data);
             
             result_buffer = (unsigned char *) patch_delta(base_buffer, base_size, delta_buffer, size, result_size);
-            //free(delta_buffer);
-            //free(base_buffer);
+            free(g_obj->mem_data);//free(delta_buffer);
+            free(base_object.mem_data);//free(base_buffer);
             if(result_buffer == NULL) {
                 printf("==== result_buffer == NULL\n");
                 return -1;
@@ -438,59 +462,139 @@ int pack_get_object(char * location, unsigned int offset, struct git_object * g_
     return 0;
 }
 
+void unload_idx(struct idx *idx)
+{
+    if(!idx)
+        return;
+    
+    if(idx->data)
+        munmap(idx->data, idx->size);
+    
+    free(idx->location);
+    free(idx);
+    idx = NULL;
+}
+
+struct idx * load_idx(char *location)
+{
+    int idx_fd;
+    int idx_size;
+    struct stat idx_st;
+    struct idx *idx;
+    void *raw_idx_data;
+    uint32_t *hdr, entries;
+
+    if((idx_fd = open(location, O_RDONLY)) < 0)
+        return NULL;
+    
+    // do some quick integrety checking
+    if(fstat(idx_fd, &idx_st)) {
+        close(idx_fd);
+        return NULL;
+    }
+    if((int) idx_st.st_size < 4*256+24+20+20) // header + one entry + packfile checksum + idxfile checksum
+    {
+        printf("Bad idx file: size is too small.\n");
+        close(idx_fd);
+        return NULL;
+    }
+    
+    // mmap the idx file
+    raw_idx_data = (unsigned char *) mmap(NULL, idx_st.st_size, PROT_READ, MAP_PRIVATE, idx_fd, 0);
+    close(idx_fd);
+    if(!raw_idx_data)
+        return NULL;
+    
+    // check for version 1 or 2
+    hdr = raw_idx_data;
+    if(*hdr == htonl(IDX_VERSION_TWO_SIG)) {
+        printf("Version 2 idx files not supported.\n");
+        munmap(raw_idx_data, idx_st.st_size);
+        return NULL;
+    }
+    
+    // Additional version integrety checks go here if desired.
+    // 1) For version 1 idxs, read all 255 chunks in the header and ensure that the preceeding
+    //    chunk is less than the following chunk. (This is unimplemented for small speed
+    //    reasons.)
+    // 2) Read the total object count and compare it to the actual size. (This is implemented.)
+    entries = ntohl(hdr[255]);
+    if((uint32_t) idx_st.st_size != (4*256 + entries * 24 + 20 + 20)) {
+        printf("Bad idx file: file length does not match the number of entries.\n");
+        munmap(raw_idx_data, idx_st.st_size);
+        return NULL;
+    }
+    
+    // Enough checking. Time to store all this to an idx struct and return it.
+    if(!(idx = malloc(sizeof(struct idx)))) {
+        printf("Failed to allocate an idx struct.\n");
+        munmap(raw_idx_data, idx_st.st_size);
+        return NULL;
+    }
+    if(!(idx->location = malloc(strlen(location)+1))) {
+        printf("Failed to allocate idx.location.\n");
+        free(idx);
+        munmap(raw_idx_data, idx_st.st_size);
+        return NULL;
+    }
+    memcpy(idx->location, location, strlen(location)+1);
+    idx->data = raw_idx_data;
+    idx->version = 1;
+    idx->size = idx_st.st_size;
+    idx->entries = entries;
+    
+    return idx;
+}
+
+// Compare two hashes. The name is a bit of a misnomer; "pf" means "partial hash"
+// and "full hash", though all this really means is the first argument needs to
+// be a struct sha1 and the second a 20-byte, binary sha1.
+// Return is identical to that of memcmp.
+static inline int hashcmp_pf(const struct sha1 *hash, const unsigned char *full_hash)
+{
+    //unsigned char *partial_hash;
+    
+    //partial_hash = &hash->sha1;
+    return memcmp((unsigned char *) &hash->sha1/*partial_hash*/, full_hash, hash->length);
+}
+
 // Note: This function does accept shortened sha1s, just be aware that it returns the first
 //       match. This could result in false positives with extremely shortened sha1s.
 //
 // Version 2 idx files are currently not supported.
-struct idx_entry * pack_idx_read(char * location, char * sha1)
+struct idx_entry * pack_idx_read(const struct idx *idx_index, const struct sha1 *hash)
 {
-    FILE *idx_fp = NULL;
-    struct idx_v1_entry entry;
     struct idx_entry *nice_entry = NULL;
-    unsigned char internal_buffer[4];
-    unsigned char *buffer = internal_buffer;
-    unsigned int total_entries = 0;
-    char * idx_sha1;
-    int i;
+    const uint32_t *level1_ofs = idx_index->data;
+    const unsigned char *index = idx_index->data;
+    unsigned hi, lo;
     
-    if(!(idx_fp = fopen(location, "r")))
-        return NULL; // not much in the way for a status message...
-
-    if(!(fread(buffer, 1, 4, idx_fp) == 4)) {
-        fclose(idx_fp);
+    if(!index || !hash)
         return NULL;
-    }
-    
-    // check for version 2, fixing network byte order
-    if((unsigned int) ( (((buffer[0] << 24) | buffer[1] << 16) | buffer[2] << 8) | buffer[3] ) == IDX_VERSION_TWO_SIG) {
-        fclose(idx_fp);
-        return NULL;
-    }
 
-    // get number of entries in the file and fix network byte orders
-    fseek(idx_fp, 1020, SEEK_SET);
-    fread(buffer, 1, 4, idx_fp);
-    total_entries = (unsigned int) (((buffer[0] << 24) | buffer[1] << 16) | buffer[2] << 8) | buffer[3];
-    
-    // !!! there is no error checking for a corrupt idx file
-    for(i = 0; i < total_entries; i++) {
-        fread(&entry, sizeof(struct idx_v1_entry), 1, idx_fp);
-        idx_sha1 = sha1_to_hex(entry.sha1);
-        if(memcmp(idx_sha1, sha1, strlen(sha1) - 1) == 0) {
-            // we have a match!
-            if(!(nice_entry = (struct idx_entry *) malloc(sizeof(struct idx_entry)))) {
-                fclose(idx_fp);
+    // Basic idea: the idx's sha1 entries are sorted smallest to largest, so we don't
+    // need to search everything.
+    index += 4 * 256; // bypass the header
+	hi = ntohl(level1_ofs[ *hash->sha1 ]);
+	lo = ((hash->sha1[0] == 0) ? 0 : ntohl(level1_ofs[ *hash->sha1 - 1 ]));
+
+	do {
+		unsigned mi = (lo + hi) / 2;
+		unsigned x = mi * 24 + 4;
+		int cmp = hashcmp_pf(hash, index + x);
+		if (!cmp) {
+		    // we have a match!
+		    if(!(nice_entry = malloc(sizeof(struct idx_entry))))
                 return NULL;
-            }
-            nice_entry->offset = (unsigned int) (((entry.offset[0] << 24) | entry.offset[1] << 16) | entry.offset[2] << 8) | entry.offset[3];
-            memcpy(nice_entry->sha1, idx_sha1, 41); // hex hash + \0
-            fclose(idx_fp);
-            
+            nice_entry->offset = ntohl(*((uint32_t *) (index + 24 * mi)));
+            memcpy(nice_entry->sha1, index + 24 * mi + 4, 20);
             return nice_entry;
-        }
-    }
-    
-    fclose(idx_fp);
+		}
+		if (cmp < 0)
+			hi = mi;
+		else
+			lo = mi+1;
+	} while (lo < hi);
     
     return NULL; // no match
 }
@@ -644,20 +748,44 @@ int loose_get_object(char * location, struct git_object * g_obj, int full)
     
     return 0;
 }
-///*
+
+inline int str_sha1_to_sha1_obj(const char *str_sha1, struct sha1 *obj_sha1)
+{
+    obj_sha1->length = strlen(str_sha1) / 2; // will drop any odd amount that get_sha1_hex drops
+    return get_sha1_hex(str_sha1, obj_sha1->sha1);
+}
+
+/*
 int main(int argc, char *argv[])
 {
-    //struct idx_entry * entry = NULL;
+    struct idx_entry * entry = NULL;
+    struct idx *idx = NULL;
+    struct sha1 hash;
+
+                          // 7e83d6e6fb8c4b11d5d95acac4a35df8969e0944
+    if(str_sha1_to_sha1_obj("7e83d6e6fb8", &hash) != 0) {
+        printf("Failed to convert the sha1 to bin.\n");
+        return 0;
+    }
     
-    //entry = pack_idx_read("/Users/kylejohnson/vector/cairo/.git/objects/pack/pack-4a32c03738a275d48dfb8927d44ccf3bbe1c1713.idx",
-    //                      "1ab804891bb71fd742");
-    //if(entry != NULL) {
-    //    printf("sha1: %s\n", entry->sha1);
-    //    printf("offset: %i\n", entry->offset);
-    //}
+    if(!(idx = load_idx("/Users/kylejohnson/vector/cairo/.git/objects/pack/pack-4a32c03738a275d48dfb8927d44ccf3bbe1c1713.idx"))) {
+        printf("Failed to load the idx file.\n");
+        return 0;
+    }
+    
+    entry = pack_idx_read(idx, &hash);
+    
+    if(entry != NULL) {
+        printf("sha1: %s\n", sha1_to_hex(entry->sha1));
+        printf("offset: %i\n", entry->offset);
+    } else {
+        printf("entry was null :(\n");
+    }
+    
+    unload_idx(idx);
 
 
-    struct git_object g_obj;
+    /*struct git_object g_obj;
 
     printf("exit: %i\n\n", pack_get_object("/Users/kylejohnson/vector/cairo/.git/objects/pack/pack-4a32c03738a275d48dfb8927d44ccf3bbe1c1713.pack", (argc > 2)? atoi(argv[2]) : 1207716, &g_obj, (argc > 1)? 1:0));
     //loose_get_object("/Users/kylejohnson/pygitlib/.git/objects/2f/838d9ee515c7004d4c4bc1a35b5aba18668f45", &g_obj, (argc > 1)? 1:0) );
@@ -681,8 +809,8 @@ int main(int argc, char *argv[])
     if(g_obj.mem_data != NULL) {
         printf("data object exists!\n\n");
         printf("%s\n-----------\n", g_obj.mem_data);
-    }
+    }*/
 
 
-    return 0;
-}/**/
+    //return 0;
+//}/**/
